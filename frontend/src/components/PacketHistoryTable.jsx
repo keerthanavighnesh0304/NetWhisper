@@ -15,7 +15,7 @@ export default function PacketHistoryTable({ packets }) {
         <table className="packets-table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>Packet / Seq</th>
               <th>Time</th>
               <th>Payload</th>
               <th>Binary Preview (First 24 bits)</th>
@@ -28,7 +28,14 @@ export default function PacketHistoryTable({ packets }) {
             {packets && packets.length > 0 ? (
               packets.slice().reverse().map((pkt) => (
                 <tr key={pkt.packet_id} className={pkt.crc_valid ? 'row-valid' : 'row-error'}>
-                  <td className="font-mono">#{pkt.packet_id}</td>
+                  <td className="font-mono">
+                    #{pkt.packet_id}
+                    {pkt.seq_num !== undefined && pkt.seq_num !== null && (
+                      <span className="text-dim text-small" style={{ marginLeft: '4px' }}>
+                        [Seq {pkt.seq_num}]
+                      </span>
+                    )}
+                  </td>
                   <td className="font-mono text-dim">
                     {new Date(pkt.timestamp * 1000).toLocaleTimeString()}
                   </td>
@@ -52,7 +59,7 @@ export default function PacketHistoryTable({ packets }) {
             ) : (
               <tr>
                 <td colSpan={7} className="empty-table-row">
-                  No packets transmitted yet. Switch to Test Mode or transmit a frame.
+                  No packets recorded yet. Transmit or receive a frame.
                 </td>
               </tr>
             )}

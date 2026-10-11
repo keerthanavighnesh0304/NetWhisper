@@ -8,12 +8,13 @@ NetWhisper acoustic communication monitoring dashboard.
 
 import asyncio
 import json
-from typing import Set
+import os
+from typing import Set, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .models import SystemStatus, TransmissionRequest
+from .models import SystemStatus, TransmissionRequest, ReceiveRequest
 from .engine_adapter import engine_adapter
 
 app = FastAPI(
@@ -91,6 +92,17 @@ async def transmit_message(req: TransmissionRequest):
     return result
 
 
+@app.post("/api/receive")
+async def receive_message(req: Optional[ReceiveRequest] = None):
+    """
+    Listens on physical microphone for incoming acoustic FSK frame.
+    Runs asynchronously in a worker thread via asyncio.to_thread so it does not block the event loop.
+    """
+    timeout = req.timeout_seconds if req else 10.0
+    result = await engine_adapter.receive_message(timeout)
+    return result
+
+
 class ModeRequest(BaseModel):
     test_mode: bool
 
@@ -132,9 +144,9 @@ async def get_integration_info():
         "contract": {
             "hook_function": "engine_adapter.register_acoustic_engine(engine_instance)",
             "expected_engine_interface": [
-                "engine.transmit(text: str) -> dict",
-                "engine.receive_callback = callback_func",
-                "engine.audio_stream_callback = callback_func (optional for live spectrogram/waveform)"
+                "fsk_engine.transmit_text(message: str, seq_num: int | None = None) -> dict",
+                "fsk_engine.receive_text(timeout_seconds: float = 10.0) -> tuple[str | None, dict]",
+                "fsk_engine.get_stats() -> dict"
             ],
             "data_rules": [
                 "Real acoustic status only shown when engine is registered.",
@@ -142,6 +154,21 @@ async def get_integration_info():
             ]
         }
     }
+
+
+@app.post("/api/register-engine")
+async def register_engine_endpoint():
+    """Manually triggers registration of Marnia's fsk_engine module."""
+    try:
+        import fsk_engine
+        engine_adapter.register_acoustic_engine(fsk_engine)
+        return {
+            "success": True,
+            "message": "fsk_engine registered successfully",
+            "audio_hardware_available": getattr(fsk_engine, "AUDIO_HARDWARE_AVAILABLE", False)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to register fsk_engine: {e}")
 
 
 @app.websocket("/ws")
@@ -181,8 +208,15 @@ async def websocket_endpoint(websocket: WebSocket):
         ws_manager.disconnect(websocket)
 
 
+# Auto-register fsk_engine if available on module load
+try:
+    import fsk_engine
+    engine_adapter.register_acoustic_engine(fsk_engine)
+except ImportError:
+    pass
+
+
 # Mount built frontend dist if available (for single-command running)
-import os
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
@@ -198,4 +232,3 @@ if os.path.exists(frontend_dist) and os.path.exists(os.path.join(frontend_dist, 
         if full_path and os.path.exists(target) and os.path.isfile(target):
             return FileResponse(target)
         return FileResponse(os.path.join(frontend_dist, "index.html"))
-

@@ -12,6 +12,7 @@ export default function App() {
     state: 'AWAITING_ENGINE',
     engine_connected: false,
     engine_name: 'Pending (Marnia Communication Engine)',
+    hardware_available: false,
     metrics: {
       packets_sent: 0,
       packets_received: 0,
@@ -32,6 +33,7 @@ export default function App() {
   const [waveformData, setWaveformData] = useState(new Array(128).fill(0));
   const [wsConnected, setWsConnected] = useState(false);
   const [isTransmitting, setIsTransmitting] = useState(false);
+  const [isReceiving, setIsReceiving] = useState(false);
   const [notification, setNotification] = useState(null);
 
   const wsRef = useRef(null);
@@ -63,7 +65,6 @@ export default function App() {
     let wsUrl = '';
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     if (window.location.port === '5173') {
-      // Vite dev server proxy or direct backend port
       wsUrl = `${protocol}//${window.location.hostname}:8000/ws`;
     } else {
       wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -93,14 +94,33 @@ export default function App() {
             } else if (data.type === 'TX_START') {
               setIsTransmitting(true);
               if (data.waveform) setWaveformData(data.waveform);
-            } else if (data.type === 'PACKET_EVENT') {
+            } else if (data.type === 'RX_START') {
+              setIsReceiving(true);
+            } else if (data.type === 'TX_COMPLETE') {
               setIsTransmitting(false);
               setStatus((prev) => ({
                 ...prev,
                 metrics: data.metrics,
-                recent_crc_status: data.crc_status,
-                last_received: data.packet.payload_text,
-                recent_packets: [...prev.recent_packets.slice(-49), data.packet],
+                last_transmitted: data.packet ? data.packet.payload_text : prev.last_transmitted,
+                recent_packets: data.packet
+                  ? [...prev.recent_packets.slice(-49), data.packet]
+                  : prev.recent_packets,
+              }));
+              if (data.waveform) setWaveformData(data.waveform);
+            } else if (data.type === 'RX_EVENT' || data.type === 'PACKET_EVENT') {
+              setIsTransmitting(false);
+              setIsReceiving(false);
+              setStatus((prev) => ({
+                ...prev,
+                metrics: data.metrics,
+                recent_crc_status: data.crc_status ?? prev.recent_crc_status,
+                last_received: data.packet ? data.packet.payload_text : prev.last_received,
+                last_transmitted: data.packet?.source?.includes('Synthetic')
+                  ? data.packet.payload_text
+                  : prev.last_transmitted,
+                recent_packets: data.packet
+                  ? [...prev.recent_packets.slice(-49), data.packet]
+                  : prev.recent_packets,
               }));
               if (data.waveform) setWaveformData(data.waveform);
             } else if (data.type === 'ENGINE_CONNECTED') {
@@ -156,6 +176,30 @@ export default function App() {
     } catch (err) {
       notify('Failed to reach backend API', 'error');
       setIsTransmitting(false);
+    }
+  };
+
+  // Receive / Listen action
+  const handleReceive = async (timeoutSeconds = 10) => {
+    setIsReceiving(true);
+    notify(`Listening on microphone for ${timeoutSeconds}s...`, 'info');
+    try {
+      const res = await fetch('/api/receive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timeout_seconds: timeoutSeconds }),
+      });
+      const data = await res.json();
+      setIsReceiving(false);
+      if (data.success) {
+        notify(`Frame received (Seq ${data.seq_num}): "${data.message}"`, 'success');
+      } else {
+        notify(data.error || 'No valid acoustic frame detected', 'warning');
+      }
+      loadStatus();
+    } catch (err) {
+      notify('Receive request failed', 'error');
+      setIsReceiving(false);
     }
   };
 
@@ -278,9 +322,12 @@ export default function App() {
           lastReceived={status.last_received}
           recentCrcStatus={status.recent_crc_status}
           onTransmit={handleTransmit}
+          onReceive={handleReceive}
           isTransmitting={isTransmitting}
+          isReceiving={isReceiving}
           isTestMode={isTestMode}
           engineConnected={status.engine_connected}
+          hardwareAvailable={status.hardware_available}
         />
 
         {/* Packet Log & History */}
@@ -291,6 +338,7 @@ export default function App() {
           engineConnected={status.engine_connected}
           engineName={status.engine_name}
           notice={status.notice}
+          hardwareAvailable={status.hardware_available}
         />
       </main>
 

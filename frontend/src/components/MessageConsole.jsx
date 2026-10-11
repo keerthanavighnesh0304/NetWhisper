@@ -5,17 +5,27 @@ export default function MessageConsole({
   lastReceived,
   recentCrcStatus,
   onTransmit,
+  onReceive,
   isTransmitting,
+  isReceiving,
   isTestMode,
-  engineConnected
+  engineConnected,
+  hardwareAvailable
 }) {
   const [inputText, setInputText] = useState('NetWhisper Packet #1');
   const [simulateNoise, setSimulateNoise] = useState(false);
+  const [rxTimeout, setRxTimeout] = useState(10);
 
-  const handleSubmit = (e) => {
+  const handleSubmitTx = (e) => {
     e.preventDefault();
     if (!inputText.trim()) return;
     onTransmit(inputText.trim(), simulateNoise);
+  };
+
+  const handleTriggerRx = () => {
+    if (onReceive) {
+      onReceive(rxTimeout);
+    }
   };
 
   const setPreset = (msg) => {
@@ -23,6 +33,7 @@ export default function MessageConsole({
   };
 
   const canTransmit = isTestMode || engineConnected;
+  const canReceive = isTestMode || engineConnected;
 
   return (
     <div className="console-grid">
@@ -33,10 +44,10 @@ export default function MessageConsole({
             <span className="dot tx-dot"></span>
             Transmitter (TX)
           </div>
-          <span className="channel-tag">FSK Modulator</span>
+          <span className="channel-tag">CPFSK Modulator</span>
         </div>
 
-        <form onSubmit={handleSubmit} className="tx-form">
+        <form onSubmit={handleSubmitTx} className="tx-form">
           <div className="input-group">
             <label htmlFor="tx-message-input">Message to transmit:</label>
             <input
@@ -53,9 +64,9 @@ export default function MessageConsole({
           <div className="presets-row">
             <span className="presets-label">Presets:</span>
             <button type="button" className="preset-btn" onClick={() => setPreset('HELLO NETWHISPER')}>HELLO</button>
-            <button type="button" className="preset-btn" onClick={() => setPreset('SYNC 0xAA')}>SYNC</button>
+            <button type="button" className="preset-btn" onClick={() => setPreset('SYNC 0xAC')}>SYNC</button>
             <button type="button" className="preset-btn" onClick={() => setPreset('ACK_SEQ_101')}>ACK_101</button>
-            <button type="button" className="preset-btn" onClick={() => setPreset('CN_LAB_ACOUSTIC')}>CN_LAB</button>
+            <button type="button" className="preset-btn" onClick={() => setPreset('NETWHISPER ACOUSTIC LINK')}>NETWHISPER</button>
           </div>
 
           {isTestMode && (
@@ -104,16 +115,48 @@ export default function MessageConsole({
             <span className="dot rx-dot"></span>
             Receiver (RX)
           </div>
-          <span className="channel-tag">FSK Demodulator + CRC</span>
+          <span className="channel-tag">CPFSK Demodulator + Matched Filter</span>
+        </div>
+
+        <div className="rx-controls-row">
+          <div className="timeout-selector">
+            <label htmlFor="rx-timeout-select">Listen Timeout:</label>
+            <select
+              id="rx-timeout-select"
+              value={rxTimeout}
+              onChange={(e) => setRxTimeout(Number(e.target.value))}
+              disabled={isReceiving}
+              className="preset-btn"
+            >
+              <option value={5}>5 seconds</option>
+              <option value={10}>10 seconds</option>
+              <option value={15}>15 seconds</option>
+            </select>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleTriggerRx}
+            disabled={isReceiving || !canReceive}
+            className="btn btn-outline-cyan"
+            id="receive-submit-button"
+          >
+            {isReceiving ? 'Listening on Microphone...' : 'Listen / Capture Frame (RX)'}
+          </button>
         </div>
 
         <div className="rx-display-section">
           <div className="display-header">Reconstructed Message:</div>
-          <div className={`display-box rx-box font-mono ${recentCrcStatus === 'CORRUPTED' ? 'corrupted' : ''}`} id="last-received-display">
-            {lastReceived ? (
+          <div
+            className={`display-box rx-box font-mono ${recentCrcStatus === 'CORRUPTED' ? 'corrupted' : ''}`}
+            id="last-received-display"
+          >
+            {isReceiving ? (
+              <span className="listening-pulse">Listening for acoustic chirp preamble ({rxTimeout}s)...</span>
+            ) : lastReceived ? (
               <div>{lastReceived}</div>
             ) : (
-              <span className="empty-text">Listening for incoming acoustic frames...</span>
+              <span className="empty-text">Awaiting incoming acoustic frame...</span>
             )}
           </div>
         </div>

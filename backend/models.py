@@ -18,18 +18,23 @@ class CRCStatus(str, Enum):
 
 class PacketRecord(BaseModel):
     packet_id: int
+    seq_num: Optional[int] = None
     timestamp: float = Field(default_factory=time.time)
     payload_text: str
     binary_data: str
     crc16: str
     crc_valid: bool
     is_retransmission: bool = False
-    source: str = "Awaiting Engine"          # "ACOUSTIC", "TEST_LOOPBACK (SIMULATED)", etc.
+    source: str = "Awaiting Engine"          # "ACOUSTIC_ENGINE", "TEST_LOOPBACK (Synthetic - Not Acoustic)", etc.
     rssi_db: Optional[float] = None          # Signal strength indicator (dB) when available from acoustic engine
+    correlation_ratio: Optional[float] = None # Preamble correlation ratio from acoustic receiver
 
 class TransmissionRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500, description="Text message to transmit")
     simulate_noise: bool = Field(default=False, description="Simulate noise corruption in test mode")
+
+class ReceiveRequest(BaseModel):
+    timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0, description="Duration to listen on microphone in seconds")
 
 class ChannelMetrics(BaseModel):
     packets_sent: int = 0
@@ -47,6 +52,7 @@ class SystemStatus(BaseModel):
     state: EngineState = EngineState.AWAITING_ENGINE
     engine_connected: bool = False
     engine_name: Optional[str] = "Pending (Marnia Communication Engine)"
+    hardware_available: bool = False
     metrics: ChannelMetrics = Field(default_factory=ChannelMetrics)
     last_transmitted: Optional[str] = None
     last_received: Optional[str] = None
