@@ -79,7 +79,7 @@ Text → Binary → Packets → FSK → Speaker → Acoustic Channel → Microph
 - [ ] Add CRC error detection
 - [ ] Add ACK/NACK and retransmission
 - [ ] Measure communication performance
-- [ ] Build and integrate the dashboard
+- [x] Build and integrate the dashboard (Keerthana: FastAPI backend, WebSockets, oscilloscope visualizer, engine adapter)
 - [ ] Perform experiments and record actual results
 - [ ] Prepare final demonstration and viva notes
 
