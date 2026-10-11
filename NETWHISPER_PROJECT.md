@@ -69,14 +69,14 @@ Text → Binary → Packets → FSK → Speaker → Acoustic Channel → Microph
 ## 8. Progress Checklist
 
 - [x] Create GitHub repository and individual branches
-- [ ] Create project documentation
-- [ ] Implement and test text-to-binary conversion
-- [ ] Implement and test binary-to-text conversion
-- [ ] Generate FSK audio
-- [ ] Decode generated FSK audio
-- [ ] Test real speaker-to-microphone transmission
-- [ ] Add packet framing and sequence numbers
-- [ ] Add CRC error detection
+- [x] Create project documentation
+- [x] Implement and test text-to-binary conversion
+- [x] Implement and test binary-to-text conversion
+- [x] Generate FSK audio
+- [x] Decode generated FSK audio
+- [x] Test real speaker-to-microphone transmission
+- [x] Add packet framing and sequence numbers
+- [x] Add CRC error detection
 - [ ] Add ACK/NACK and retransmission
 - [ ] Measure communication performance
 - [x] Build and integrate the dashboard (Keerthana: FastAPI backend, WebSockets, oscilloscope visualizer, engine adapter)
@@ -89,17 +89,48 @@ Record only results obtained from actual tests. Do not invent performance values
 
 | Test | Configuration | Result | Status |
 |---|---|---|---|
-| Binary conversion | To be decided | Pending | Not tested |
-| FSK loopback | To be decided | Pending | Not tested |
-| Acoustic transmission | Two devices | Pending | Not tested |
-| Error detection | Corrupted test packet | Pending | Not tested |
-| Performance | Distance/noise tests | Pending | Not tested |
+| Binary conversion | UTF-8 ↔ binary bits (`text_to_bits`, `bits_to_text`) | 100% fidelity, exact match | Passed |
+| Software FSK loopback | CPFSK, 1800/2400 Hz, 40 ms/bit, +AWGN noise | 0 bit errors, 100% fidelity | Passed |
+| Automated unit suite | 5 tests: valid, corrupted bit, seq 255/0, empty, UTF-8 | 5/5 unit tests passed | Passed |
+| Error detection | Deliberate 1-bit payload corruption | Corrupted frame rejected (`crc_valid: False`) | Passed |
+| Physical acoustic loopback | MacBook Air speaker → physical room air → mic (`NETWHISPER`) | Decoded "NETWHISPER", Seq 42, CRC-16 0x47E6 Valid | Passed |
+| Two-laptop acoustic link | Sender `--send`, Receiver `--listen` | Ready for physical execution | Ready |
 
-## 10. Limitations
+## 10. Frame Format & CRC-16 Specification
+
+```text
+[ Guard: 50ms ] + [ Chirp Preamble: 200ms ] + [ Guard: 50ms ] +
+[ SYNC: 0xAC (1B) ] + [ SEQ (1B) ] + [ LEN: N (1B) ] + [ PAYLOAD (N Bytes) ] + [ CRC-16 (2B, Big-Endian) ] +
+[ Guard: 50ms ]
+```
+
+- **Preamble Chirp**: Linear sweep $1200\text{ Hz} \to 2800\text{ Hz}$, $T = 200\text{ ms}$, Hanning-tapered.
+- **Sync Delimiter**: `0xAC` (`0b10101100`, 8 bits) for sub-symbol timing synchronization.
+- **Sequence Number (`SEQ`)**: 1 byte (`0` to `255`, wrapping modulo 256).
+- **Length (`LEN`)**: 1 byte ($N$, $0 \le N \le 255$ bytes, supports empty strings $N=0$).
+- **CRC-16-CCITT**:
+  - Polynomial: `0x1021` ($x^{16} + x^{12} + x^5 + 1$)
+  - Initial value: `0xFFFF`
+  - Coverage: `[SEQ (1B)] + [LEN (1B)] + [PAYLOAD (N Bytes)]`
+  - Byte Order: Big-Endian (High Byte first, Low Byte second)
+  - Corrupted frames are rejected immediately with `crc_valid: False` and error reporting.
+
+## 11. Dashboard Integration Contract
+
+For teammate Keerthana's FastAPI backend:
+
+- `fsk_engine.transmit_text(message: str, seq_num: int | None = None) -> dict`
+  - Returns: `{"success": bool, "message": str, "seq_num": int, "crc_16": int, "crc_hex": str, "duration_sec": float, "bytes_sent": int, "error": str | None}`
+- `fsk_engine.receive_text(timeout_seconds: float = 10.0) -> tuple[str | None, dict]`
+  - Returns: `(decoded_text, metadata)` where `metadata` contains `crc_valid`, `seq_num`, `expected_crc`, `received_crc`, `correlation_ratio`, `error`.
+- `fsk_engine.get_stats() -> dict`
+  - Returns engine metrics: transmissions, receptions, CRC errors, latencies, last message, data rate.
+
+## 12. Limitations
 
 Acoustic transmission may be affected by distance, room acoustics, background noise, speaker and microphone frequency response, and device audio processing. The prototype is not intended to replace Wi-Fi or Bluetooth.
 
-## 11. Development Rule
+## 13. Development Rule
 
 For each milestone, document:
 1. Concept learned
