@@ -28,6 +28,9 @@ class PacketRecord(BaseModel):
     source: str = "Awaiting Engine"          # "ACOUSTIC_ENGINE", "TEST_LOOPBACK (Synthetic - Not Acoustic)", etc.
     rssi_db: Optional[float] = None          # Signal strength indicator (dB) when available from acoustic engine
     correlation_ratio: Optional[float] = None # Preamble correlation ratio from acoustic receiver
+    latency_ms: Optional[float] = None       # Measured transmission or decode latency (ms)
+    data_rate_bps: Optional[float] = None    # Effective throughput (bps)
+    direction: Optional[str] = "TX"          # "TX" (Outbound) or "RX" (Inbound)
 
 class TransmissionRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500, description="Text message to transmit")
@@ -42,8 +45,13 @@ class ChannelMetrics(BaseModel):
     crc_valid_count: int = 0
     crc_error_count: int = 0
     retransmissions: int = 0
-    latency_ms: float = 0.0                  # Measured round-trip or transmit-decode latency
-    data_rate_bps: float = 0.0               # Effective data rate in bits per second
+    latency_ms: float = 0.0                  # Most recent measured latency
+    data_rate_bps: float = 0.0               # Most recent measured throughput
+    crc_error_rate: float = 0.0              # CRC Error Rate percentage (0.0 to 100.0%)
+    retransmission_rate: float = 0.0         # Retransmission rate percentage (0.0 to 100.0%)
+    average_latency_ms: float = 0.0          # Average latency across all recorded packets
+    average_data_rate_bps: float = 0.0       # Average throughput across all recorded packets
+    peak_data_rate_bps: float = 0.0          # Peak measured throughput
     last_tx_time: Optional[float] = None
     last_rx_time: Optional[float] = None
 
@@ -58,5 +66,5 @@ class SystemStatus(BaseModel):
     last_received: Optional[str] = None
     recent_crc_status: CRCStatus = CRCStatus.IDLE
     recent_packets: List[PacketRecord] = Field(default_factory=list)
-    active_mode_label: str = "Idle — Awaiting Acoustic Engine"
+    active_mode_label: str = "Idle - Awaiting Acoustic Engine"
     notice: str = "No acoustic transmission claims until Marnia's engine is linked."

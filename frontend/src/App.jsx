@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import WaveformCanvas from './components/WaveformCanvas';
 import MetricsGrid from './components/MetricsGrid';
+import PerformanceChart from './components/PerformanceChart';
 import MessageConsole from './components/MessageConsole';
 import PacketHistoryTable from './components/PacketHistoryTable';
 import IntegrationPanel from './components/IntegrationPanel';
@@ -307,6 +308,13 @@ export default function App() {
           crcStatus={status.recent_crc_status}
           engineConnected={status.engine_connected}
           isTestMode={isTestMode}
+        />
+
+        {/* Network Performance Analytics Chart */}
+        <PerformanceChart
+          packets={status.recent_packets}
+          metrics={status.metrics}
+          wsConnected={wsConnected}
         />
 
         {/* Oscilloscope Waveform Row */}

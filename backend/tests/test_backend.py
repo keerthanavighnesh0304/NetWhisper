@@ -361,13 +361,92 @@ class TestNetWhisperBackend(unittest.TestCase):
         self.assertEqual(status["last_received"], "Decoded Inbound Frame")
         self.assertEqual(status["recent_crc_status"], "VALID")
 
-        # Check packet history ordering
+        # Check packet history ordering & direction
         packets = status["recent_packets"]
         self.assertEqual(len(packets), 2)
         self.assertEqual(packets[0]["payload_text"], "Outbound Packet")
         self.assertEqual(packets[0]["seq_num"], 1)
+        self.assertEqual(packets[0]["direction"], "TX")
         self.assertEqual(packets[1]["payload_text"], "Decoded Inbound Frame")
         self.assertEqual(packets[1]["seq_num"], 2)
+        self.assertEqual(packets[1]["direction"], "RX")
+
+    def test_network_performance_analytics_computations(self):
+        """Verifies accurate calculation of CRC error rate, retransmission rate, latency and throughput averages."""
+        class MockAnalyticsEngine:
+            AUDIO_HARDWARE_AVAILABLE = True
+            def transmit_text(self, message, seq_num=None):
+                return {
+                    "success": True,
+                    "seq_num": 10,
+                    "crc_hex": "0xAAAA",
+                    "bytes_sent": len(message.encode("utf-8")),
+                    "duration_sec": 0.5,
+                    "error": None
+                }
+            def receive_text(self, timeout_seconds=10.0):
+                # Will be overridden in test
+                pass
+
+        mock = MockAnalyticsEngine()
+        engine_adapter.register_acoustic_engine(mock)
+
+        # 1. Successful transmit
+        tx_resp = self.client.post("/api/transmit", json={"message": "Analytics Payload 1"})
+        self.assertEqual(tx_resp.status_code, 200)
+
+        # 2. Successful receive
+        mock.receive_text = lambda timeout_seconds=10.0: ("Analytics RX 1", {
+            "success": True,
+            "seq_num": 11,
+            "crc_valid": True,
+            "received_crc": 0xBBBB,
+            "correlation_ratio": 12.0,
+            "length_bytes": 14,
+            "error": None
+        })
+        rx_resp1 = self.client.post("/api/receive", json={"timeout_seconds": 2.0})
+        self.assertEqual(rx_resp1.status_code, 200)
+
+        # 3. Corrupted receive
+        mock.receive_text = lambda timeout_seconds=10.0: (None, {
+            "success": False,
+            "detected": True,
+            "crc_valid": False,
+            "seq_num": 12,
+            "received_crc": 0xCCCC,
+            "correlation_ratio": 9.5,
+            "length_bytes": 14,
+            "raw_text": "CorruptedData",
+            "error": "CRC-16 mismatch"
+        })
+        rx_resp2 = self.client.post("/api/receive", json={"timeout_seconds": 2.0})
+        self.assertEqual(rx_resp2.status_code, 200)
+
+        status = self.client.get("/api/status").json()
+        metrics = status["metrics"]
+
+        self.assertEqual(metrics["packets_sent"], 1)
+        self.assertEqual(metrics["packets_received"], 2)
+        self.assertEqual(metrics["crc_valid_count"], 1)
+        self.assertEqual(metrics["crc_error_count"], 1)
+        # CRC Error Rate = 1 error / (1 valid + 1 error) * 100% = 50.0%
+        self.assertEqual(metrics["crc_error_rate"], 50.0)
+        # Retransmission Rate = 1 retransmission / 1 sent * 100% = 100.0%
+        self.assertEqual(metrics["retransmission_rate"], 100.0)
+        # Latency and throughput metrics
+        self.assertGreater(metrics["average_latency_ms"], 0)
+        self.assertGreater(metrics["average_data_rate_bps"], 0)
+        self.assertGreaterEqual(metrics["peak_data_rate_bps"], metrics["average_data_rate_bps"])
+
+        # Check packet records direction and metrics
+        packets = status["recent_packets"]
+        self.assertEqual(len(packets), 3)
+        self.assertEqual(packets[0]["direction"], "TX")
+        self.assertEqual(packets[1]["direction"], "RX")
+        self.assertEqual(packets[2]["direction"], "RX")
+        self.assertTrue(packets[1]["crc_valid"])
+        self.assertFalse(packets[2]["crc_valid"])
 
 
 if __name__ == "__main__":
