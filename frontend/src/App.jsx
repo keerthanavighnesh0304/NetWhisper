@@ -156,23 +156,40 @@ export default function App() {
   }, []);
 
   // Transmit action
-  const handleTransmit = async (message, simulateNoise) => {
+  const handleTransmit = async (message, simulateNoise, enableArq = false, isRetry = false) => {
     setIsTransmitting(true);
     try {
       const res = await fetch('/api/transmit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, simulate_noise: simulateNoise }),
+        body: JSON.stringify({
+          message,
+          simulate_noise: simulateNoise,
+          enable_arq: enableArq,
+          is_retry: isRetry,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
         notify(data.detail || 'Transmission failed', 'error');
         setIsTransmitting(false);
       } else {
-        notify(
-          `Packet #${data.packet_id} transmitted (${data.crc_valid ? 'CRC OK' : 'CRC Error Detected'})`,
-          data.crc_valid ? 'success' : 'warning'
-        );
+        if (data.arq_status === 'ACK_RECEIVED') {
+          notify(
+            `Packet #${data.packet_id} (Seq ${data.seq_num}) verified by ACK! ARQ Retries: ${data.retries_attempted}`,
+            'success'
+          );
+        } else if (data.arq_status === 'ARQ_DISABLED_SIMPLEX') {
+          notify(
+            `Packet #${data.packet_id} transmitted simplex (acoustic auto-feedback disabled for safety).`,
+            'info'
+          );
+        } else {
+          notify(
+            `Packet #${data.packet_id} transmitted (${data.crc_valid ? 'CRC OK' : 'CRC Error Detected'})`,
+            data.crc_valid ? 'success' : 'warning'
+          );
+        }
       }
     } catch (err) {
       notify('Failed to reach backend API', 'error');

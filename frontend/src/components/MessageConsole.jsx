@@ -14,12 +14,13 @@ export default function MessageConsole({
 }) {
   const [inputText, setInputText] = useState('NetWhisper Packet #1');
   const [simulateNoise, setSimulateNoise] = useState(false);
+  const [enableArq, setEnableArq] = useState(false);
   const [rxTimeout, setRxTimeout] = useState(10);
 
   const handleSubmitTx = (e) => {
     e.preventDefault();
     if (!inputText.trim()) return;
-    onTransmit(inputText.trim(), simulateNoise);
+    onTransmit(inputText.trim(), simulateNoise, enableArq);
   };
 
   const handleTriggerRx = () => {
@@ -65,8 +66,20 @@ export default function MessageConsole({
             <span className="presets-label">Presets:</span>
             <button type="button" className="preset-btn" onClick={() => setPreset('HELLO NETWHISPER')}>HELLO</button>
             <button type="button" className="preset-btn" onClick={() => setPreset('SYNC 0xAC')}>SYNC</button>
-            <button type="button" className="preset-btn" onClick={() => setPreset('ACK_SEQ_101')}>ACK_101</button>
+            <button type="button" className="preset-btn" onClick={() => setPreset('ACK:1')}>ACK:1</button>
             <button type="button" className="preset-btn" onClick={() => setPreset('NETWHISPER ACOUSTIC LINK')}>NETWHISPER</button>
+          </div>
+
+          <div className="arq-toggle-row">
+            <label className="checkbox-label arq-label">
+              <input
+                type="checkbox"
+                id="enable-arq-checkbox"
+                checked={enableArq}
+                onChange={(e) => setEnableArq(e.target.checked)}
+              />
+              <span>Stop-and-Wait ARQ (Auto-Retry on Timeout / Corrupt Frame)</span>
+            </label>
           </div>
 
           {isTestMode && (

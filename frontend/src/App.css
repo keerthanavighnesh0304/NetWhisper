@@ -427,6 +427,17 @@
   border-color: rgba(56, 189, 248, 0.3);
 }
 
+.arq-toggle-row {
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px dashed rgba(56, 189, 248, 0.25);
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+}
+
+.arq-label {
+  color: #38bdf8;
+}
+
 .noise-toggle-row {
   background: rgba(245, 158, 11, 0.08);
   border: 1px dashed rgba(245, 158, 11, 0.25);
@@ -1260,6 +1271,28 @@
   background: rgba(255, 255, 255, 0.05);
   padding: 1px 5px;
   border-radius: 3px;
+}
+
+.pkt-retry-pill {
+  font-size: 0.68rem;
+  color: #fbbf24;
+  margin-left: 5px;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+}
+
+.pkt-dup-pill {
+  font-size: 0.68rem;
+  color: #f43f5e;
+  margin-left: 5px;
+  background: rgba(244, 63, 94, 0.15);
+  border: 1px solid rgba(244, 63, 94, 0.3);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 700;
 }
 
 .payload-cell {

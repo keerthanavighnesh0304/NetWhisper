@@ -100,6 +100,16 @@ export default function PacketHistoryTable({ packets = [] }) {
                           Seq {pkt.seq_num}
                         </span>
                       )}
+                      {pkt.is_retransmission && (
+                        <span className="pkt-retry-pill font-mono" title={`Retransmission attempt ${pkt.retry_count || 1}`}>
+                          Retry {pkt.retry_count ? `#${pkt.retry_count}` : ''}
+                        </span>
+                      )}
+                      {pkt.is_duplicate && (
+                        <span className="pkt-dup-pill font-mono" title="Duplicate frame suppressed by receiver">
+                          DUP
+                        </span>
+                      )}
                     </td>
 
                     {/* Direction: TX or RX */}

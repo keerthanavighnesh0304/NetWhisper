@@ -76,8 +76,15 @@ class TestNetWhisperBackend(unittest.TestCase):
         status_resp = self.client.get("/api/status")
         status = status_resp.json()
         self.assertEqual(status["metrics"]["crc_error_count"], 1)
-        self.assertEqual(status["metrics"]["retransmissions"], 1)
+        # Retransmissions counter strictly increments when a retry is actually attempted, not merely upon error
+        self.assertEqual(status["metrics"]["retransmissions"], 0)
         self.assertEqual(status["recent_crc_status"], "CORRUPTED")
+
+        # Now trigger an explicit manual retransmission attempt
+        retry_resp = self.client.post("/api/transmit", json={"message": "CorruptThisData", "is_retry": True})
+        self.assertEqual(retry_resp.status_code, 200)
+        status_after_retry = self.client.get("/api/status").json()
+        self.assertEqual(status_after_retry["metrics"]["retransmissions"], 1)
 
     def test_reset_metrics(self):
         self.client.post("/api/mode", json={"test_mode": True})
@@ -228,7 +235,8 @@ class TestNetWhisperBackend(unittest.TestCase):
         status = self.client.get("/api/status").json()
         self.assertEqual(status["metrics"]["packets_received"], 1)
         self.assertEqual(status["metrics"]["crc_error_count"], 1)
-        self.assertEqual(status["metrics"]["retransmissions"], 1)
+        # Corrupted receive frame must NOT increment retransmission count
+        self.assertEqual(status["metrics"]["retransmissions"], 0)
         self.assertEqual(status["recent_crc_status"], "CORRUPTED")
 
     def test_real_fsk_engine_module_integration(self):
@@ -423,17 +431,22 @@ class TestNetWhisperBackend(unittest.TestCase):
         rx_resp2 = self.client.post("/api/receive", json={"timeout_seconds": 2.0})
         self.assertEqual(rx_resp2.status_code, 200)
 
+        # 4. Attempt an actual retransmission
+        tx_retry = self.client.post("/api/transmit", json={"message": "Analytics Retry Payload", "is_retry": True})
+        self.assertEqual(tx_retry.status_code, 200)
+
         status = self.client.get("/api/status").json()
         metrics = status["metrics"]
 
-        self.assertEqual(metrics["packets_sent"], 1)
+        self.assertEqual(metrics["packets_sent"], 2)
         self.assertEqual(metrics["packets_received"], 2)
         self.assertEqual(metrics["crc_valid_count"], 1)
         self.assertEqual(metrics["crc_error_count"], 1)
         # CRC Error Rate = 1 error / (1 valid + 1 error) * 100% = 50.0%
         self.assertEqual(metrics["crc_error_rate"], 50.0)
-        # Retransmission Rate = 1 retransmission / 1 sent * 100% = 100.0%
-        self.assertEqual(metrics["retransmission_rate"], 100.0)
+        # Retransmission Rate = 1 retransmission / 2 sent * 100% = 50.0%
+        self.assertEqual(metrics["retransmissions"], 1)
+        self.assertEqual(metrics["retransmission_rate"], 50.0)
         # Latency and throughput metrics
         self.assertGreater(metrics["average_latency_ms"], 0)
         self.assertGreater(metrics["average_data_rate_bps"], 0)
@@ -441,12 +454,214 @@ class TestNetWhisperBackend(unittest.TestCase):
 
         # Check packet records direction and metrics
         packets = status["recent_packets"]
-        self.assertEqual(len(packets), 3)
+        self.assertEqual(len(packets), 4)
         self.assertEqual(packets[0]["direction"], "TX")
         self.assertEqual(packets[1]["direction"], "RX")
         self.assertEqual(packets[2]["direction"], "RX")
+        self.assertEqual(packets[3]["direction"], "TX")
         self.assertTrue(packets[1]["crc_valid"])
         self.assertFalse(packets[2]["crc_valid"])
+        self.assertTrue(packets[3]["is_retransmission"])
+
+    def test_arq_ack_success(self):
+        """Validates Stop-and-Wait ARQ immediate ACK success on clean channel."""
+        self.client.post("/api/mode", json={"test_mode": True})
+        resp = self.client.post("/api/transmit", json={
+            "message": "Clean ARQ Packet",
+            "enable_arq": True,
+            "max_retries": 2,
+            "simulate_noise": False
+        })
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["arq_status"], "ACK_RECEIVED")
+        self.assertEqual(data["retries_attempted"], 0)
+
+        status = self.client.get("/api/status").json()
+        self.assertEqual(status["metrics"]["successful_acks_received"], 1)
+        self.assertEqual(status["metrics"]["timeouts_count"], 0)
+        self.assertEqual(status["metrics"]["retransmissions"], 0)
+        self.assertEqual(status["last_arq_status"], "ACK_RECEIVED")
+
+    def test_arq_timeout_retries_and_exhaustion(self):
+        """Validates Stop-and-Wait ARQ timeouts, retransmission attempts, and RETRY_EXHAUSTED status."""
+        self.client.post("/api/mode", json={"test_mode": True})
+        resp = self.client.post("/api/transmit", json={
+            "message": "Corrupted ARQ Packet",
+            "enable_arq": True,
+            "max_retries": 3,
+            "simulate_noise": True
+        })
+        # When retries are exhausted without ACK, transmit returns 400 with detail
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("retries exhausted without ACK", resp.json()["detail"])
+
+        status = self.client.get("/api/status").json()
+        self.assertEqual(status["last_arq_status"], "RETRY_EXHAUSTED")
+        self.assertEqual(status["metrics"]["retransmissions"], 3)
+        self.assertEqual(status["metrics"]["timeouts_count"], 4)  # 1 initial + 3 retries
+        self.assertEqual(status["metrics"]["successful_acks_received"], 0)
+
+    def test_arq_sequence_number_and_payload_preservation(self):
+        """Verifies that original payload and sequence number are preserved identically across retransmissions."""
+        self.client.post("/api/mode", json={"test_mode": True})
+        engine_adapter.current_tx_seq = 42
+
+        resp = self.client.post("/api/transmit", json={
+            "message": "PreservePayload",
+            "enable_arq": True,
+            "max_retries": 2,
+            "simulate_noise": True
+        })
+        self.assertEqual(resp.status_code, 400)
+
+        status = self.client.get("/api/status").json()
+        packets = status["recent_packets"]
+        # Total 3 packets: initial attempt (0) + retry 1 + retry 2
+        self.assertEqual(len(packets), 3)
+
+        for idx, pkt in enumerate(packets):
+            # Sequence number preserved
+            self.assertEqual(pkt["seq_num"], 42)
+            self.assertEqual(pkt["retry_count"], idx)
+            if idx == 0:
+                self.assertFalse(pkt["is_retransmission"])
+            else:
+                self.assertTrue(pkt["is_retransmission"])
+
+        # Sequence number must NOT advance when retries were exhausted
+        self.assertEqual(engine_adapter.current_tx_seq, 42)
+
+    def test_receiver_duplicate_frame_suppression(self):
+        """Verifies receiver duplicate suppression: same sequence number is detected, counted, and flagged."""
+        class MockSeqEngine:
+            AUDIO_HARDWARE_AVAILABLE = True
+            def receive_text(self, timeout_seconds=10.0):
+                return "Accepted Text", {
+                    "success": True,
+                    "seq_num": 18,
+                    "crc_valid": True,
+                    "received_crc": 0x4321,
+                    "correlation_ratio": 14.0,
+                    "length_bytes": 13,
+                    "error": None
+                }
+
+        engine_adapter.register_acoustic_engine(MockSeqEngine())
+
+        # 1. Receive first time -> accepted as new frame
+        rx1 = self.client.post("/api/receive", json={"timeout_seconds": 2.0})
+        self.assertEqual(rx1.status_code, 200)
+        d1 = rx1.json()
+        self.assertTrue(d1["success"])
+        self.assertFalse(d1["is_duplicate"])
+
+        status1 = self.client.get("/api/status").json()
+        self.assertEqual(status1["metrics"]["packets_received"], 1)
+        self.assertEqual(status1["metrics"]["duplicate_packets_received"], 0)
+        self.assertEqual(status1["last_received"], "Accepted Text")
+
+        # 2. Receive second time with same seq_num 18 -> suppressed as DUPLICATE
+        rx2 = self.client.post("/api/receive", json={"timeout_seconds": 2.0})
+        self.assertEqual(rx2.status_code, 200)
+        d2 = rx2.json()
+        self.assertTrue(d2["success"])
+        self.assertTrue(d2["is_duplicate"])
+
+        status2 = self.client.get("/api/status").json()
+        self.assertEqual(status2["metrics"]["packets_received"], 2)
+        self.assertEqual(status2["metrics"]["duplicate_packets_received"], 1)
+        # Duplicate packet record is flagged
+        self.assertTrue(status2["recent_packets"][-1]["is_duplicate"])
+
+    def test_acoustic_feedback_safeguard_simplex_mode(self):
+        """Verifies physical acoustic bidirectional feedback safeguard defaults to disabled simplex mode."""
+        class MockAcousticEngine:
+            AUDIO_HARDWARE_AVAILABLE = True
+            def transmit_text(self, message, seq_num=None):
+                return {
+                    "success": True,
+                    "seq_num": seq_num or 0,
+                    "crc_hex": "0x5555",
+                    "duration_sec": 0.3,
+                    "bytes_sent": len(message),
+                    "error": None
+                }
+
+        engine_adapter.register_acoustic_engine(MockAcousticEngine())
+        self.assertFalse(engine_adapter.acoustic_feedback_enabled)
+
+        # ARQ request with acoustic feedback disabled returns safe simplex fallback
+        resp = self.client.post("/api/transmit", json={
+            "message": "Simplex Safe Frame",
+            "enable_arq": True
+        })
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["arq_status"], "ARQ_DISABLED_SIMPLEX")
+        self.assertIn("Automatic acoustic feedback is currently disabled", data["notice"])
+
+        # Enable acoustic feedback via API
+        cfg_resp = self.client.post("/api/acoustic-feedback", json={"enabled": True})
+        self.assertEqual(cfg_resp.status_code, 200)
+        self.assertTrue(cfg_resp.json()["acoustic_feedback_enabled"])
+        self.assertTrue(engine_adapter.acoustic_feedback_enabled)
+
+    def test_nack_triggered_retry_acoustic(self):
+        """Verifies NACK / timeout triggers retry in acoustic mode when feedback is enabled."""
+        attempt_tracker = {"tx_count": 0}
+
+        class MockBidirectionalEngine:
+            AUDIO_HARDWARE_AVAILABLE = True
+            def transmit_text(self, message, seq_num=None):
+                attempt_tracker["tx_count"] += 1
+                return {
+                    "success": True,
+                    "seq_num": seq_num,
+                    "crc_hex": "0x1234",
+                    "duration_sec": 0.05,
+                    "bytes_sent": len(message),
+                    "error": None
+                }
+            def receive_text(self, timeout_seconds=10.0):
+                # First receive attempt returns NACK; second receive attempt returns ACK
+                if attempt_tracker["tx_count"] == 1:
+                    return "NACK:9", {
+                        "success": True,
+                        "seq_num": 9,
+                        "crc_valid": True,
+                        "received_crc": 0x9999,
+                        "correlation_ratio": 10.0,
+                        "error": None
+                    }
+                else:
+                    return "ACK:9", {
+                        "success": True,
+                        "seq_num": 9,
+                        "crc_valid": True,
+                        "received_crc": 0xAAAA,
+                        "correlation_ratio": 12.0,
+                        "error": None
+                    }
+
+        engine_adapter.register_acoustic_engine(MockBidirectionalEngine())
+        engine_adapter.set_acoustic_feedback(True)
+        engine_adapter.current_tx_seq = 9
+
+        resp = self.client.post("/api/transmit", json={
+            "message": "Data Requiring Retry",
+            "enable_arq": True,
+            "max_retries": 2,
+            "ack_timeout_seconds": 0.1
+        })
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["arq_status"], "ACK_RECEIVED")
+        self.assertEqual(data["retries_attempted"], 1)
+        self.assertEqual(data["seq_num"], 9)
+        self.assertEqual(attempt_tracker["tx_count"], 2)
 
 
 if __name__ == "__main__":

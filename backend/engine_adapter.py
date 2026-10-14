@@ -72,6 +72,13 @@ class EngineAdapter:
         self.mark_freq: float = 1800.0  # Hz (FSK binary 1)
         self.space_freq: float = 1200.0 # Hz (FSK binary 0)
 
+        # Stop-and-Wait ARQ state
+        self.current_tx_seq: int = 0
+        self.last_accepted_rx_seq: Optional[int] = None
+        self.last_accepted_rx_payload: Optional[str] = None
+        self.last_arq_status: str = "IDLE"
+        self.acoustic_feedback_enabled: bool = False
+
     def register_acoustic_engine(self, engine_obj: Any) -> bool:
         """
         Integration point for Marnia's engine.
@@ -94,6 +101,10 @@ class EngineAdapter:
         else:
             self.state = EngineState.AWAITING_ENGINE if not self.acoustic_engine else EngineState.ACOUSTIC_LIVE
 
+    def set_acoustic_feedback(self, enabled: bool):
+        """Toggle physical acoustic bidirectional feedback (ACK/NACK over air)."""
+        self.acoustic_feedback_enabled = enabled
+
     def reset_stats(self):
         """Reset all transmission and error metrics."""
         self.metrics = ChannelMetrics()
@@ -103,6 +114,10 @@ class EngineAdapter:
         self.recent_crc_status = CRCStatus.IDLE
         self.packet_counter = 0
         self.current_signal_samples = [0.0] * 128
+        self.current_tx_seq = 0
+        self.last_accepted_rx_seq = None
+        self.last_accepted_rx_payload = None
+        self.last_arq_status = "IDLE"
 
     def _update_computed_rates(self):
         """Recalculates error rates, retransmission rates, and running averages."""
@@ -159,21 +174,54 @@ class EngineAdapter:
             recent_packets=list(self.recent_packets),
             active_mode_label=mode_label,
             notice=notice,
+            last_arq_status=self.last_arq_status,
         )
 
-    async def transmit_message(self, message: str, simulate_noise: bool = False) -> Dict[str, Any]:
+    async def transmit_message(
+        self,
+        message: str,
+        simulate_noise: bool = False,
+        enable_arq: bool = False,
+        max_retries: int = 2,
+        ack_timeout_seconds: float = 4.0,
+        is_retry: bool = False,
+        seq_num: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """
         Handles message transmission.
-        If acoustic engine is hooked up, delegates to physical acoustic engine.
-        Otherwise, if in TEST_MODE, performs safe synthetic loopback calculation.
-        If in AWAITING_ENGINE mode, rejects with clear instruction.
+        Supports simplex transmission and Stop-and-Wait ARQ automatic retransmission.
+        Preserves sequence numbers and payload across retries.
         """
         if self.state == EngineState.TEST_MODE:
-            # SYNTHETIC TEST TRANSMISSION
-            return await self._simulate_test_transmission(message, simulate_noise)
+            if enable_arq:
+                return await self._run_test_arq_transmission(
+                    message=message,
+                    simulate_noise=simulate_noise,
+                    max_retries=max_retries,
+                    ack_timeout_seconds=ack_timeout_seconds,
+                    seq_num=seq_num
+                )
+            else:
+                return await self._simulate_test_transmission(
+                    message=message,
+                    simulate_noise=simulate_noise,
+                    is_retry=is_retry,
+                    seq_num=seq_num
+                )
         elif self.acoustic_engine:
-            # REAL ACOUSTIC ENGINE TRANSMISSION HOOK
-            return await self._transmit_via_acoustic_engine(message)
+            if enable_arq:
+                return await self._run_acoustic_arq_transmission(
+                    message=message,
+                    max_retries=max_retries,
+                    ack_timeout_seconds=ack_timeout_seconds,
+                    seq_num=seq_num
+                )
+            else:
+                return await self._transmit_via_acoustic_engine(
+                    message=message,
+                    seq_num=seq_num,
+                    is_retry=is_retry
+                )
         else:
             return {
                 "success": False,
@@ -181,7 +229,148 @@ class EngineAdapter:
                 "state": self.state.value
             }
 
-    async def _transmit_via_acoustic_engine(self, message: str) -> Dict[str, Any]:
+    async def _run_test_arq_transmission(
+        self,
+        message: str,
+        simulate_noise: bool,
+        max_retries: int,
+        ack_timeout_seconds: float,
+        seq_num: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Stop-and-Wait ARQ logic in Test Mode:
+        - Target sequence number and payload preserved across retries
+        - Configurable retry limits
+        - Simulated ACK reception vs timeout handling
+        - Incrementing retransmission metrics only upon actual retry attempts
+        - RETRY_EXHAUSTED status on limit reached
+        """
+        target_seq = seq_num if seq_num is not None else self.current_tx_seq
+        last_result = None
+
+        for attempt in range(max_retries + 1):
+            is_retry = (attempt > 0)
+            result = await self._simulate_test_transmission(
+                message=message,
+                simulate_noise=simulate_noise,
+                is_retry=is_retry,
+                seq_num=target_seq,
+                retry_count=attempt
+            )
+            last_result = result
+
+            if result.get("crc_valid"):
+                self.last_arq_status = "ACK_RECEIVED"
+                self.metrics.successful_acks_received += 1
+                if seq_num is None:
+                    self.current_tx_seq = (target_seq + 1) % 256
+                result["arq_status"] = "ACK_RECEIVED"
+                result["retries_attempted"] = attempt
+                return result
+
+            # Frame corrupted or lost: simulate timeout waiting for ACK
+            self.metrics.timeouts_count += 1
+            if attempt < max_retries:
+                await asyncio.sleep(min(0.05, ack_timeout_seconds / 20.0))
+
+        self.last_arq_status = "RETRY_EXHAUSTED"
+        return {
+            "success": False,
+            "error": f"Stop-and-Wait ARQ retry limit reached ({max_retries} retries exhausted without ACK)",
+            "packet_id": last_result.get("packet_id") if last_result else self.packet_counter,
+            "seq_num": target_seq,
+            "crc_valid": False,
+            "arq_status": "RETRY_EXHAUSTED",
+            "retries_attempted": max_retries,
+            "source": "TEST_LOOPBACK (Synthetic - Not Acoustic)"
+        }
+
+    async def _run_acoustic_arq_transmission(
+        self,
+        message: str,
+        max_retries: int,
+        ack_timeout_seconds: float,
+        seq_num: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Stop-and-Wait ARQ for physical acoustic channel.
+        If acoustic feedback is enabled, alternates TX and RX to receive acoustic ACK.
+        If acoustic feedback is disabled (default for simplex safety), reports limitation.
+        """
+        if not self.acoustic_feedback_enabled:
+            res = await self._transmit_via_acoustic_engine(
+                message=message,
+                seq_num=seq_num,
+                is_retry=False,
+                retry_count=0
+            )
+            self.last_arq_status = "ARQ_DISABLED_SIMPLEX"
+            res["arq_status"] = "ARQ_DISABLED_SIMPLEX"
+            res["notice"] = (
+                "Acoustic Stop-and-Wait ARQ requires bidirectional acoustic channel. "
+                "Automatic acoustic feedback is currently disabled to prevent audio driver collisions on simplex link."
+            )
+            return res
+
+        target_seq = seq_num if seq_num is not None else self.current_tx_seq
+
+        for attempt in range(max_retries + 1):
+            is_retry = (attempt > 0)
+            res = await self._transmit_via_acoustic_engine(
+                message=message,
+                seq_num=target_seq,
+                is_retry=is_retry,
+                retry_count=attempt
+            )
+            if not res.get("success"):
+                return res
+
+            # Turnaround delay for soundcard to clear output buffer before listening
+            await asyncio.sleep(0.35)
+
+            # Listen for acoustic ACK on microphone
+            try:
+                rx_res = await self.receive_message(timeout_seconds=ack_timeout_seconds)
+                if rx_res.get("success") and rx_res.get("crc_valid"):
+                    rx_msg = (rx_res.get("message") or "").strip()
+                    rx_seq = rx_res.get("seq_num")
+                    expected_ack = f"ACK:{target_seq}"
+                    if rx_msg == expected_ack or (rx_msg.startswith("ACK") and rx_seq == target_seq):
+                        self.last_arq_status = "ACK_RECEIVED"
+                        self.metrics.successful_acks_received += 1
+                        if seq_num is None:
+                            self.current_tx_seq = (target_seq + 1) % 256
+                        return {
+                            "success": True,
+                            "arq_status": "ACK_RECEIVED",
+                            "seq_num": target_seq,
+                            "retries_attempted": attempt,
+                            "result": res
+                        }
+            except Exception:
+                pass
+
+            self.metrics.timeouts_count += 1
+            if attempt < max_retries:
+                await asyncio.sleep(0.2)
+
+        self.last_arq_status = "RETRY_EXHAUSTED"
+        return {
+            "success": False,
+            "error": f"Stop-and-Wait ARQ retry limit reached ({max_retries} retries exhausted without ACK)",
+            "arq_status": "RETRY_EXHAUSTED",
+            "seq_num": target_seq,
+            "retries_attempted": max_retries,
+            "source": "ACOUSTIC_ENGINE"
+        }
+
+    async def _transmit_via_acoustic_engine(
+        self,
+        message: str,
+        seq_num: Optional[int] = None,
+        is_retry: bool = False,
+        retry_count: int = 0
+    ) -> Dict[str, Any]:
         """Invoked when Marnia's engine is connected."""
         start_time = time.time()
         self.state = EngineState.TRANSMITTING
@@ -196,9 +385,16 @@ class EngineAdapter:
         })
 
         try:
+            if seq_num is None:
+                tx_seq = self.current_tx_seq
+                if not is_retry:
+                    self.current_tx_seq = (self.current_tx_seq + 1) % 256
+            else:
+                tx_seq = int(seq_num) & 0xFF
+
             # Support Marnia's engine transmit_text signature, plus legacy transmit/send
             if hasattr(self.acoustic_engine, "transmit_text"):
-                result = await asyncio.to_thread(self.acoustic_engine.transmit_text, message)
+                result = await asyncio.to_thread(self.acoustic_engine.transmit_text, message, tx_seq)
             elif hasattr(self.acoustic_engine, "transmit"):
                 result = await asyncio.to_thread(self.acoustic_engine.transmit, message)
             elif hasattr(self.acoustic_engine, "send"):
@@ -229,13 +425,16 @@ class EngineAdapter:
             elapsed_sec = float(result.get("duration_sec", (time.time() - start_time)))
             latency_ms = round(elapsed_sec * 1000.0, 2)
             crc_hex = str(result.get("crc_hex", f"0x{result.get('crc_16', 0):04X}"))
-            seq_num = result.get("seq_num")
+            engine_seq = result.get("seq_num", tx_seq)
             bytes_sent = int(result.get("bytes_sent", len(message.encode("utf-8"))))
             total_bits = (bytes_sent + 5) * 8  # [SYNC, SEQ, LEN, PAYLOAD, CRC-16]
             data_rate_bps = round(total_bits / elapsed_sec, 1) if elapsed_sec > 0 else 25.0
 
             self.packet_counter += 1
             self.metrics.packets_sent += 1
+            if is_retry:
+                self.metrics.retransmissions += 1
+
             self.metrics.last_tx_time = time.time()
             self.metrics.latency_ms = latency_ms
             self.metrics.data_rate_bps = data_rate_bps
@@ -243,13 +442,14 @@ class EngineAdapter:
 
             pkt_record = PacketRecord(
                 packet_id=self.packet_counter,
-                seq_num=seq_num,
+                seq_num=engine_seq,
                 timestamp=time.time(),
                 payload_text=message,
                 binary_data=binary,
                 crc16=crc_hex,
                 crc_valid=True,
-                is_retransmission=False,
+                is_retransmission=is_retry,
+                retry_count=retry_count,
                 source="ACOUSTIC_ENGINE",
                 latency_ms=latency_ms,
                 data_rate_bps=data_rate_bps,
@@ -273,13 +473,15 @@ class EngineAdapter:
                 "success": True,
                 "source": "ACOUSTIC_ENGINE",
                 "packet_id": self.packet_counter,
-                "seq_num": seq_num,
+                "seq_num": engine_seq,
                 "crc_valid": True,
                 "crc_hex": crc_hex,
                 "latency_ms": latency_ms,
                 "data_rate_bps": data_rate_bps,
                 "bytes_sent": bytes_sent,
                 "duration_sec": elapsed_sec,
+                "is_retransmission": is_retry,
+                "retry_count": retry_count,
                 "result": result
             }
 
@@ -367,11 +569,20 @@ class EngineAdapter:
             rx_data_rate_bps = round(total_frame_bits / frame_duration_sec, 1)
 
             if meta.get("success", False) and decoded_text is not None:
+                # Check for duplicate frame
+                is_duplicate = False
+                if seq_num is not None and self.last_accepted_rx_seq is not None and seq_num == self.last_accepted_rx_seq:
+                    is_duplicate = True
+                    self.metrics.duplicate_packets_received += 1
+                else:
+                    self.last_accepted_rx_seq = seq_num
+                    self.last_accepted_rx_payload = decoded_text
+                    self.last_received = decoded_text
+
                 self.packet_counter += 1
                 self.metrics.packets_received += 1
                 self.metrics.crc_valid_count += 1
                 self.recent_crc_status = CRCStatus.VALID
-                self.last_received = decoded_text
                 self.metrics.last_rx_time = time.time()
                 self.metrics.latency_ms = rx_latency_ms
                 self.metrics.data_rate_bps = rx_data_rate_bps
@@ -385,6 +596,7 @@ class EngineAdapter:
                     crc16=crc_hex,
                     crc_valid=True,
                     is_retransmission=False,
+                    is_duplicate=is_duplicate,
                     source="ACOUSTIC_ENGINE",
                     correlation_ratio=corr_ratio,
                     latency_ms=rx_latency_ms,
@@ -416,6 +628,7 @@ class EngineAdapter:
                     "latency_ms": rx_latency_ms,
                     "data_rate_bps": rx_data_rate_bps,
                     "correlation_ratio": corr_ratio,
+                    "is_duplicate": is_duplicate,
                     "metadata": meta
                 }
 
@@ -424,7 +637,8 @@ class EngineAdapter:
                 self.packet_counter += 1
                 self.metrics.packets_received += 1
                 self.metrics.crc_error_count += 1
-                self.metrics.retransmissions += 1
+                # NOTE: self.metrics.retransmissions is NOT incremented here!
+                # Retransmissions only increment when an actual retransmission is attempted by sender.
                 self.recent_crc_status = CRCStatus.CORRUPTED
                 raw_text = meta.get("raw_text") or "?"
                 self.last_received = f"[CORRUPTED CRC ERROR] {raw_text}"
@@ -440,7 +654,7 @@ class EngineAdapter:
                     binary_data=text_to_binary(raw_text),
                     crc16=crc_hex,
                     crc_valid=False,
-                    is_retransmission=True,
+                    is_retransmission=False,
                     source="ACOUSTIC_ENGINE",
                     correlation_ratio=corr_ratio,
                     latency_ms=rx_latency_ms,
@@ -492,7 +706,14 @@ class EngineAdapter:
                 "source": "ACOUSTIC_ENGINE"
             }
 
-    async def _simulate_test_transmission(self, message: str, simulate_noise: bool) -> Dict[str, Any]:
+    async def _simulate_test_transmission(
+        self,
+        message: str,
+        simulate_noise: bool,
+        is_retry: bool = False,
+        seq_num: Optional[int] = None,
+        retry_count: int = 0
+    ) -> Dict[str, Any]:
         """
         Explicit synthetic loopback for validating dashboard UI, WebSocket,
         and metrics visualization before Marnia's engine is attached.
@@ -506,6 +727,13 @@ class EngineAdapter:
         raw_bytes = message.encode("utf-8")
         crc_val = compute_crc16(raw_bytes)
         crc_hex = f"0x{crc_val:04X}"
+
+        if seq_num is None:
+            active_seq = self.current_tx_seq
+            if not is_retry:
+                self.current_tx_seq = (self.current_tx_seq + 1) % 256
+        else:
+            active_seq = int(seq_num) & 0xFF
 
         # Generate sample FSK waveform points for oscilloscope
         self._generate_synthetic_fsk_waveform(binary)
@@ -541,31 +769,44 @@ class EngineAdapter:
         # Update metrics
         self.metrics.packets_sent += 1
         self.metrics.packets_received += 1
+        if is_retry:
+            self.metrics.retransmissions += 1
+
         self.metrics.last_tx_time = tx_time
         self.metrics.last_rx_time = rx_time
         self.metrics.latency_ms = latency_ms
         self.metrics.data_rate_bps = data_rate_bps
         self.last_transmitted = message
 
+        is_duplicate = False
         if crc_matches:
+            if self.last_accepted_rx_seq is not None and active_seq == self.last_accepted_rx_seq and is_retry:
+                is_duplicate = True
+                self.metrics.duplicate_packets_received += 1
+            else:
+                self.last_accepted_rx_seq = active_seq
+                self.last_accepted_rx_payload = received_text
+                self.last_received = received_text
+
             self.metrics.crc_valid_count += 1
             self.recent_crc_status = CRCStatus.VALID
-            self.last_received = received_text
         else:
             self.metrics.crc_error_count += 1
-            self.metrics.retransmissions += 1
+            # Retransmissions only increment on actual retry transmission, not upon receiving error
             self.recent_crc_status = CRCStatus.CORRUPTED
             self.last_received = f"[CORRUPTED CRC ERROR] {received_text}"
 
         packet_record = PacketRecord(
             packet_id=pkt_id,
-            seq_num=pkt_id % 256,
+            seq_num=active_seq,
             timestamp=rx_time,
             payload_text=received_text,
             binary_data=text_to_binary(received_text),
             crc16=crc_hex,
             crc_valid=crc_matches,
-            is_retransmission=is_corrupted,
+            is_retransmission=is_retry,
+            retry_count=retry_count,
+            is_duplicate=is_duplicate,
             source="TEST_LOOPBACK (Synthetic - Not Acoustic)",
             latency_ms=latency_ms,
             data_rate_bps=data_rate_bps,
@@ -592,9 +833,12 @@ class EngineAdapter:
         return {
             "success": True,
             "packet_id": pkt_id,
+            "seq_num": active_seq,
             "crc_valid": crc_matches,
             "latency_ms": latency_ms,
             "data_rate_bps": data_rate_bps,
+            "is_duplicate": is_duplicate,
+            "is_retransmission": is_retry,
             "source": "TEST_LOOPBACK (Synthetic - Not Acoustic)"
         }
 

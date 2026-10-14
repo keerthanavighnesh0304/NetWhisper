@@ -85,11 +85,34 @@ async def transmit_message(req: TransmissionRequest):
     """
     Transmit a text message.
     Delegates to acoustic engine if connected, or runs synthetic loopback if in TEST_MODE.
+    Supports Stop-and-Wait ARQ automatic retransmission when enable_arq=True.
     """
-    result = await engine_adapter.transmit_message(req.message, req.simulate_noise)
+    result = await engine_adapter.transmit_message(
+        message=req.message,
+        simulate_noise=req.simulate_noise,
+        enable_arq=req.enable_arq,
+        max_retries=req.max_retries,
+        ack_timeout_seconds=req.ack_timeout_seconds,
+        is_retry=req.is_retry
+    )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Transmission failed"))
     return result
+
+
+class FeedbackConfigRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/acoustic-feedback")
+async def configure_acoustic_feedback(req: FeedbackConfigRequest):
+    """Enable or disable physical acoustic bidirectional feedback (ACK/NACK over air)."""
+    engine_adapter.set_acoustic_feedback(req.enabled)
+    return {
+        "success": True,
+        "acoustic_feedback_enabled": engine_adapter.acoustic_feedback_enabled,
+        "notice": "Acoustic feedback enabled" if req.enabled else "Acoustic feedback disabled (simplex safe mode)"
+    }
 
 
 @app.post("/api/receive")

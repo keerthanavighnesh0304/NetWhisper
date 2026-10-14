@@ -31,10 +31,17 @@ class PacketRecord(BaseModel):
     latency_ms: Optional[float] = None       # Measured transmission or decode latency (ms)
     data_rate_bps: Optional[float] = None    # Effective throughput (bps)
     direction: Optional[str] = "TX"          # "TX" (Outbound) or "RX" (Inbound)
+    frame_type: Optional[str] = "DATA"       # "DATA", "ACK", "NACK"
+    retry_count: Optional[int] = 0           # 0 for initial frame, 1, 2... for retransmissions
+    is_duplicate: Optional[bool] = False     # True if received frame was suppressed as duplicate
 
 class TransmissionRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500, description="Text message to transmit")
     simulate_noise: bool = Field(default=False, description="Simulate noise corruption in test mode")
+    enable_arq: bool = Field(default=False, description="Enable Stop-and-Wait ARQ automatic retransmission")
+    max_retries: int = Field(default=2, ge=0, le=5, description="Maximum retransmission attempts")
+    ack_timeout_seconds: float = Field(default=4.0, ge=0.1, le=15.0, description="Timeout waiting for ACK in seconds")
+    is_retry: bool = Field(default=False, description="Explicit manual retry request")
 
 class ReceiveRequest(BaseModel):
     timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0, description="Duration to listen on microphone in seconds")
@@ -45,6 +52,9 @@ class ChannelMetrics(BaseModel):
     crc_valid_count: int = 0
     crc_error_count: int = 0
     retransmissions: int = 0
+    duplicate_packets_received: int = 0      # Duplicate frames suppressed by receiver
+    successful_acks_received: int = 0        # ACKs successfully received by sender
+    timeouts_count: int = 0                  # Sender timeouts waiting for ACK
     latency_ms: float = 0.0                  # Most recent measured latency
     data_rate_bps: float = 0.0               # Most recent measured throughput
     crc_error_rate: float = 0.0              # CRC Error Rate percentage (0.0 to 100.0%)
@@ -68,3 +78,4 @@ class SystemStatus(BaseModel):
     recent_packets: List[PacketRecord] = Field(default_factory=list)
     active_mode_label: str = "Idle - Awaiting Acoustic Engine"
     notice: str = "No acoustic transmission claims until Marnia's engine is linked."
+    last_arq_status: Optional[str] = "IDLE"
