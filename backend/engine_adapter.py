@@ -104,6 +104,33 @@ class EngineAdapter:
         self.packet_counter = 0
         self.current_signal_samples = [0.0] * 128
 
+    def _update_computed_rates(self):
+        """Recalculates error rates, retransmission rates, and running averages."""
+        # CRC Error Rate (Frame Error Rate % over all received frames checked)
+        total_crc_checked = self.metrics.crc_valid_count + self.metrics.crc_error_count
+        if total_crc_checked > 0:
+            self.metrics.crc_error_rate = round((self.metrics.crc_error_count / total_crc_checked) * 100.0, 1)
+        else:
+            self.metrics.crc_error_rate = 0.0
+
+        # Retransmission Rate %
+        total_traffic = self.metrics.packets_sent if self.metrics.packets_sent > 0 else self.metrics.packets_received
+        if total_traffic > 0:
+            self.metrics.retransmission_rate = round((self.metrics.retransmissions / total_traffic) * 100.0, 1)
+        else:
+            self.metrics.retransmission_rate = 0.0
+
+        # Average latency across recent packets that have a measured latency > 0
+        valid_latencies = [p.latency_ms for p in self.recent_packets if p.latency_ms is not None and p.latency_ms > 0]
+        if valid_latencies:
+            self.metrics.average_latency_ms = round(sum(valid_latencies) / len(valid_latencies), 1)
+
+        # Average and peak data rates
+        valid_rates = [p.data_rate_bps for p in self.recent_packets if p.data_rate_bps is not None and p.data_rate_bps > 0]
+        if valid_rates:
+            self.metrics.average_data_rate_bps = round(sum(valid_rates) / len(valid_rates), 1)
+            self.metrics.peak_data_rate_bps = round(max(valid_rates), 1)
+
     def get_status(self) -> SystemStatus:
         hw_avail = getattr(self.acoustic_engine, "AUDIO_HARDWARE_AVAILABLE", False) if self.acoustic_engine else False
         if self.acoustic_engine:
@@ -114,7 +141,7 @@ class EngineAdapter:
                 mode_label = "ACOUSTIC ENGINE (Audio Hardware Unavailable)"
                 notice = "Marnia's FSK engine loaded, but sounddevice is not available. Install sounddevice for physical audio."
         elif self.state == EngineState.TEST_MODE:
-            mode_label = "TEST MODE (Synthetic Loopback — Not Acoustic)"
+            mode_label = "TEST MODE (Synthetic Loopback - Not Acoustic)"
             notice = "Synthetic simulation mode for dashboard testing. NOT physical acoustic transmission."
         else:
             mode_label = "IDLE (Awaiting Acoustic Engine Integration)"
@@ -129,7 +156,7 @@ class EngineAdapter:
             last_transmitted=self.last_transmitted,
             last_received=self.last_received,
             recent_crc_status=self.recent_crc_status,
-            recent_packets=self.recent_packets[-10:],
+            recent_packets=list(self.recent_packets),
             active_mode_label=mode_label,
             notice=notice,
         )
@@ -223,11 +250,16 @@ class EngineAdapter:
                 crc16=crc_hex,
                 crc_valid=True,
                 is_retransmission=False,
-                source="ACOUSTIC_ENGINE"
+                source="ACOUSTIC_ENGINE",
+                latency_ms=latency_ms,
+                data_rate_bps=data_rate_bps,
+                direction="TX"
             )
             self.recent_packets.append(pkt_record)
             if len(self.recent_packets) > 50:
                 self.recent_packets.pop(0)
+
+            self._update_computed_rates()
 
             event_payload = {
                 "type": "TX_COMPLETE",
@@ -326,6 +358,14 @@ class EngineAdapter:
             rx_crc = meta.get("received_crc")
             crc_hex = f"0x{rx_crc:04X}" if rx_crc is not None else "--"
 
+            # Compute realistic frame over-the-air latency and effective throughput
+            payload_len = meta.get("length_bytes", len(decoded_text.encode("utf-8")) if decoded_text else 0)
+            # Physical frame duration: guard(50ms) + chirp(200ms) + guard(50ms) + bits * 40ms + guard(50ms)
+            frame_duration_sec = 0.35 + ((payload_len + 5) * 8 * 0.04)
+            rx_latency_ms = round(frame_duration_sec * 1000.0, 1)
+            total_frame_bits = (payload_len + 5) * 8
+            rx_data_rate_bps = round(total_frame_bits / frame_duration_sec, 1)
+
             if meta.get("success", False) and decoded_text is not None:
                 self.packet_counter += 1
                 self.metrics.packets_received += 1
@@ -333,6 +373,8 @@ class EngineAdapter:
                 self.recent_crc_status = CRCStatus.VALID
                 self.last_received = decoded_text
                 self.metrics.last_rx_time = time.time()
+                self.metrics.latency_ms = rx_latency_ms
+                self.metrics.data_rate_bps = rx_data_rate_bps
 
                 pkt_record = PacketRecord(
                     packet_id=self.packet_counter,
@@ -344,11 +386,16 @@ class EngineAdapter:
                     crc_valid=True,
                     is_retransmission=False,
                     source="ACOUSTIC_ENGINE",
-                    correlation_ratio=corr_ratio
+                    correlation_ratio=corr_ratio,
+                    latency_ms=rx_latency_ms,
+                    data_rate_bps=rx_data_rate_bps,
+                    direction="RX"
                 )
                 self.recent_packets.append(pkt_record)
                 if len(self.recent_packets) > 50:
                     self.recent_packets.pop(0)
+
+                self._update_computed_rates()
 
                 event_payload = {
                     "type": "RX_EVENT",
@@ -366,6 +413,8 @@ class EngineAdapter:
                     "seq_num": seq_num,
                     "crc_valid": True,
                     "crc_hex": crc_hex,
+                    "latency_ms": rx_latency_ms,
+                    "data_rate_bps": rx_data_rate_bps,
                     "correlation_ratio": corr_ratio,
                     "metadata": meta
                 }
@@ -380,6 +429,8 @@ class EngineAdapter:
                 raw_text = meta.get("raw_text") or "?"
                 self.last_received = f"[CORRUPTED CRC ERROR] {raw_text}"
                 self.metrics.last_rx_time = time.time()
+                self.metrics.latency_ms = rx_latency_ms
+                self.metrics.data_rate_bps = rx_data_rate_bps
 
                 pkt_record = PacketRecord(
                     packet_id=self.packet_counter,
@@ -391,11 +442,16 @@ class EngineAdapter:
                     crc_valid=False,
                     is_retransmission=True,
                     source="ACOUSTIC_ENGINE",
-                    correlation_ratio=corr_ratio
+                    correlation_ratio=corr_ratio,
+                    latency_ms=rx_latency_ms,
+                    data_rate_bps=rx_data_rate_bps,
+                    direction="RX"
                 )
                 self.recent_packets.append(pkt_record)
                 if len(self.recent_packets) > 50:
                     self.recent_packets.pop(0)
+
+                self._update_computed_rates()
 
                 event_payload = {
                     "type": "RX_EVENT",
@@ -413,6 +469,8 @@ class EngineAdapter:
                     "seq_num": seq_num,
                     "crc_valid": False,
                     "crc_hex": crc_hex,
+                    "latency_ms": rx_latency_ms,
+                    "data_rate_bps": rx_data_rate_bps,
                     "correlation_ratio": corr_ratio,
                     "raw_text": raw_text
                 }
@@ -508,11 +566,16 @@ class EngineAdapter:
             crc16=crc_hex,
             crc_valid=crc_matches,
             is_retransmission=is_corrupted,
-            source="TEST_LOOPBACK (Synthetic - Not Acoustic)"
+            source="TEST_LOOPBACK (Synthetic - Not Acoustic)",
+            latency_ms=latency_ms,
+            data_rate_bps=data_rate_bps,
+            direction="TX/RX"
         )
         self.recent_packets.append(packet_record)
         if len(self.recent_packets) > 50:
             self.recent_packets.pop(0)
+
+        self._update_computed_rates()
 
         self.state = EngineState.TEST_MODE
 
